@@ -5,13 +5,19 @@
 
 #include <algorithm>
 #include <cstring>
+#include <ext/pb_ds/assoc_container.hpp>
 #include <future>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+using namespace __gnu_pbds;
 using namespace std;
+
+template <class K, class V>
+using ht = gp_hash_table<K, V>;
 
 #define NUM_CITIES 102
 const char *INPUT_FILENAME = "input.txt";
@@ -32,9 +38,11 @@ struct MappedFile {
 struct Result {
   long long city_cost[NUM_CITIES];
   long long product_cost[NUM_CITIES][NUM_CITIES];
-  unordered_map<string, int> product_id;
-  unordered_map<string, int> city_id;
-  Result() {
+  ht<string, int> product_id;
+  ht<string, int> city_id;
+  Result()
+      : product_id({}, {}, {}, {}, {1 << 7}),
+        city_id({}, {}, {}, {}, {1 << 7}) {
     fill_n(city_cost, NUM_CITIES, 0);
     fill_n((long long *)product_cost, NUM_CITIES * NUM_CITIES, (long long)4e18);
   }
@@ -50,7 +58,7 @@ inline const MappedFile map_input() {
   const char *addr = static_cast<const char *>(
       mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0u));
   if (addr == MAP_FAILED) handle_error("map_input: mmap failed");
-  // madvise((void *)addr, 0, MADV_SEQUENTIAL);
+  madvise((void *)addr, sb.st_size, MADV_SEQUENTIAL);
 
   return {fd, (size_t)sb.st_size, addr};
 }
@@ -88,7 +96,7 @@ inline long long consume_float_as_long(char *&start) {
   return ans;
 }
 
-inline int find_or_create(unordered_map<string, int> &id_map, const string &k) {
+inline int find_or_create(ht<string, int> &id_map, const string &k) {
   int id = -1;
   if (id_map.find(k) == id_map.end()) {
     id = id_map[k] = id_map.size();
@@ -98,13 +106,83 @@ inline int find_or_create(unordered_map<string, int> &id_map, const string &k) {
   return id;
 }
 
-Result process_chunk(char *start, char *end) {
+class ThreadPool {
+ public:
+  Result *results;
+  void start(const int num_threads);
+  void queue_job(const function<void(Result &)> &job);
+  void stop();
+  bool busy();
+
+ private:
+  void loop(int id);
+
+  bool should_terminate = false;
+  mutex queue_mutex;
+  condition_variable mutex_condition;
+  vector<thread> threads;
+  queue<function<void(Result &)>> jobs;
+};
+
+void ThreadPool::start(const int num_threads) {
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back(thread(&ThreadPool::loop, this, i));
+  }
+  results = new Result[num_threads];
+}
+
+void ThreadPool::loop(int id) {
+  while (true) {
+    function<void(Result &)> job;
+    {
+      unique_lock<mutex> lock(queue_mutex);
+      mutex_condition.wait(
+          lock, [this] { return !jobs.empty() || should_terminate; });
+      if (should_terminate) {
+        return;
+      }
+      job = jobs.front();
+      jobs.pop();
+    }
+    job(results[id]);
+  }
+}
+
+void ThreadPool::queue_job(const function<void(Result &)> &job) {
+  {
+    unique_lock<mutex> lock(queue_mutex);
+    jobs.push(job);
+  }
+  mutex_condition.notify_one();
+}
+
+bool ThreadPool::busy() {
+  bool poolbusy = false;
+  {
+    unique_lock<mutex> lock(queue_mutex);
+    poolbusy = !jobs.empty();
+  }
+  return poolbusy;
+}
+
+void ThreadPool::stop() {
+  {
+    unique_lock<mutex> lock(queue_mutex);
+    should_terminate = true;
+  }
+  mutex_condition.notify_all();
+  for (thread &active_thread : threads) {
+    active_thread.join();
+  }
+  threads.clear();
+}
+
+void process_chunk(Result &r, char *start, char *end) {
   if (*start != '\n') {
     start = (char *)rawmemchr(start, '\n');
   }
   ++start;
 
-  Result r;
   char *cur = start;
   string city;
   city.reserve(40);
@@ -122,30 +200,37 @@ Result process_chunk(char *start, char *end) {
     r.product_cost[cid][pid] = min(r.product_cost[cid][pid], price);
     r.city_cost[cid] += price;
   }
-
-  return r;
 }
 
-vector<Result> process_concurrently(const MappedFile &mp) {
+inline void process_concurrently(const MappedFile &mp,
+                                 vector<Result> &results) {
   char *start = (char *)mp.file_data;
   char *end = start + mp.file_size;
-  const size_t block_size = mp.file_size / NUM_THREADS;
+  const size_t block_size = 1024 * 1024 * 100;  // 100mb
+  const size_t chunks_count = mp.file_size / block_size;
 
-  vector<future<Result>> future_results;
+  ThreadPool thread_pool;
+  thread_pool.start(NUM_THREADS);
+  for (size_t i = 0; i < chunks_count; i++) {
+    char *chunk_start = start + i * block_size;
+    char *chunk_end = start + (i + 1) * block_size;
+    if (i + 1 == chunks_count) chunk_end = end;
+    if (chunk_start >= chunk_end) break;
+
+    thread_pool.queue_job([chunk_start, chunk_end](Result &r) {
+      process_chunk(r, chunk_start, chunk_end);
+    });
+  }
+
+  while (thread_pool.busy()) {
+  }
+  thread_pool.stop();
   for (int i = 0; i < NUM_THREADS; i++) {
-    future_results.emplace_back(
-        async(process_chunk, start + i * block_size,
-              i == NUM_THREADS - 1 ? end : (start + (i + 1) * block_size)));
+    results.emplace_back(thread_pool.results[i]);
   }
-
-  vector<Result> results;
-  for (auto &fr : future_results) {
-    results.emplace_back(fr.get());
-  }
-  return results;
 }
 
-Result merge(vector<Result> &results) {
+inline Result merge(vector<Result> &results) {
   Result mr;
   for (auto &r : results) {
     for (auto &cid : r.city_id) {
@@ -198,7 +283,9 @@ inline void ans(Result &result) {
 int main() {
   const MappedFile mp = map_input();
 
-  vector<Result> results = process_concurrently(mp);
+  vector<Result> results;
+  results.reserve(NUM_THREADS);
+  process_concurrently(mp, results);
   Result result = merge(results);
   ans(result);
 
